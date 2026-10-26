@@ -81,8 +81,25 @@ jobs:
         # CHECK: the README lists no LLVM build dependencies; these are the usual ones.
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang lld make cmake ninja-build python3 zip curl git \
-            pkg-config libplist-dev libssl-dev xz-utils
+          sudo apt-get install -y make cmake ninja-build python3 zip curl git \
+            pkg-config libplist-dev libssl-dev xz-utils wget gnupg lsb-release software-properties-common
+
+      - name: Install clang 21 (the iOS 26.5 SDK's libc++ needs __builtin_clzg, clang 19+)
+        # The runner's default clang is 18, which failed with
+        # "use of undeclared identifier '__builtin_clzg'". build-llvm.sh calls /usr/bin/clang++,
+        # so point /usr/bin/clang, clang++ and lld at version 21.
+        run: |
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 21
+          sudo apt-get install -y clang-21 lld-21
+          sudo ln -sf /usr/bin/clang-21 /usr/bin/clang
+          sudo ln -sf /usr/bin/clang++-21 /usr/bin/clang++
+          sudo ln -sf /usr/bin/ld.lld-21 /usr/bin/ld.lld
+          sudo ln -sf /usr/bin/lld-21 /usr/bin/lld
+          clang --version
+          clang++ --version
+          ld.lld --version
 
       - name: Get ipab (build-llvm.sh and make toolchain take the iOS SDK from it)
         run: git clone --depth 1 https://github.com/mezyqq/ios-compiler-for-linux.git "$IPAB_HOME"
