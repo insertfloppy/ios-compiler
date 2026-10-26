@@ -26,8 +26,8 @@ on:
 env:
   IPAB_HOME: ${{ github.workspace }}/ios-compiler-for-linux
   J: "4"
-# setup.sh defaults to 6.4 (404)
-SWIFTVER: "6.4.1"
+  # setup.sh defaults to 6.4, whose download URL returned 404. swift.org lists 6.4.1 as the current release.
+  SWIFTVER: "6.4.1"
 
 jobs:
   hello-ipa:
