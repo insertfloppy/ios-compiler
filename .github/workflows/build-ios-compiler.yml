@@ -1,0 +1,125 @@
+# Phase 0 for the on-device toolchain (see XCODE_ON_IOS_PLAN.md).
+#
+# Put this file in YOUR FORK of https://github.com/mezyqq/ios-compiler
+# (so `actions/checkout` below gets the Makefile, build-llvm.sh, ioscc.cpp ...).
+# Run it from the Actions tab ("Run workflow").
+#
+# Two independent jobs:
+#   hello-ipa  - quick check (about 10-20 min): builds a Swift hello-world .ipa
+#                with ipab on Linux. You can sideload it to prove the signing and
+#                install path works before spending hours on LLVM.
+#   toolchain  - the slow one (about 2-3 h): builds clang + lld for iOS, then
+#                libioscc.a and the trimmed SDK bundle.
+#
+# NOT YET RUN. Open questions are marked CHECK.
+
+name: build-ios-compiler
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_toolchain:
+        description: "Also build the LLVM toolchain (slow)"
+        type: boolean
+        default: true
+
+env:
+  IPAB_HOME: ${{ github.workspace }}/ios-compiler-for-linux
+  J: "4"
+
+jobs:
+  hello-ipa:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Free disk space (setup.sh alone needs about 4 GB)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Install host packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld make zip curl git pkg-config libplist-dev libssl-dev xz-utils
+
+      - name: Get ipab
+        run: git clone --depth 1 https://github.com/mezyqq/ios-compiler-for-linux.git "$IPAB_HOME"
+
+      - name: ipab setup (downloads iOS SDK, Swift for Linux, builds ldid)
+        working-directory: ${{ env.IPAB_HOME }}
+        run: ./setup.sh
+
+      - name: Build a Swift hello-world .ipa
+        working-directory: ${{ env.IPAB_HOME }}
+        run: |
+          ./ipab new Hello swiftui
+          ./ipab build Hello
+          ls -lh Hello/build/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Hello-ipa
+          path: ${{ env.IPAB_HOME }}/Hello/build/Hello.ipa
+          if-no-files-found: error
+
+  toolchain:
+    if: ${{ inputs.build_toolchain }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # hosted jobs stop at 6 h
+    steps:
+      - name: Free disk space (the LLVM cross-build is large)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af || true
+          df -h /
+
+      - uses: actions/checkout@v4
+
+      - name: Install host packages
+        # CHECK: the README lists no LLVM build dependencies; these are the usual ones.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld make cmake ninja-build python3 zip curl git \
+            pkg-config libplist-dev libssl-dev xz-utils
+
+      - name: Get ipab (build-llvm.sh and make toolchain take the iOS SDK from it)
+        run: git clone --depth 1 https://github.com/mezyqq/ios-compiler-for-linux.git "$IPAB_HOME"
+
+      - name: ipab setup
+        working-directory: ${{ env.IPAB_HOME }}
+        run: ./setup.sh
+
+      - name: Build clang + lld for iOS (about 40 min native + 1-2 h cross)
+        # CHECK: the README says "J=4 threads"; confirm J is the variable build-llvm.sh reads.
+        run: ./build-llvm.sh > build.log 2>&1
+
+      - name: Show the end of the build log on failure
+        if: failure()
+        run: tail -n 100 build.log || true
+
+      - name: Build libioscc.a
+        run: make
+
+      - name: Assemble the trimmed SDK bundle
+        run: make toolchain
+
+      - name: Sizes
+        run: |
+          du -sh out/* llvm-ios-build/lib 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-compiler-out
+          # CHECK: the app links llvm-ios-build/lib/*.a too; confirm the path after the first run.
+          path: |
+            out/libioscc.a
+            out/toolchain
+            llvm-ios-build/lib/*.a
+          if-no-files-found: error
