@@ -116,11 +116,25 @@ jobs:
         if: failure()
         run: tail -n 100 build.log || true
 
+      - name: Patch ioscc.cpp (JIT load failed with "duplicate definition of symbol '_atexit'")
+        # LLVM 22's default LLJIT platform (GenericLLVMIRPlatform) already defines atexit in the main
+        # JITDylib, so ioscc's own absolute "atexit" hook collides with it. Drop that one hook; the
+        # exit/_exit/abort hooks do not collide and stay. Side effect: functions a JIT-run program
+        # registers with atexit() are not run when its main returns.
+        run: |
+          grep -n 'mangleAndIntern("atexit")' ioscc.cpp
+          sed -i '/mangleAndIntern("atexit")/d' ioscc.cpp
+          if grep -q 'mangleAndIntern("atexit")' ioscc.cpp; then echo "patch did not apply"; exit 1; fi
+          echo "atexit hook removed"
+
       - name: Build libioscc.a
         run: make
 
       - name: Assemble the trimmed SDK bundle
-        run: make toolchain
+        run: |
+          make toolchain
+          # Keep the empty bin/ folder (artifacts drop empty folders); argv[0] is <toolchain>/bin/clang.
+          mkdir -p out/toolchain/bin && touch out/toolchain/bin/.keep
 
       - name: Sizes
         run: |
@@ -141,4 +155,18 @@ jobs:
             out/libioscc.a
             out/toolchain
             llvm-ios-build/lib/*.a
+          if-no-files-found: error
+
+      # Headers and llvm-ar needed to rebuild libioscc.a from ioscc.cpp in minutes later,
+      # without repeating the 2-3 hour LLVM build.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ioscc-dev
+          path: |
+            llvm-ios-build/include
+            llvm-ios-build/tools/clang/include
+            llvm-src/llvm/include
+            llvm-src/clang/include
+            llvm-src/lld/include
+            llvm-native/bin/llvm-ar
           if-no-files-found: error
