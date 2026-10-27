@@ -1,12 +1,13 @@
 # Builds a small test app (IosccTest) that links libioscc.a + LLVM and, when you tap a button,
-# compiles and links a C file on the device. Uses the toolchain artifact from a finished
+# compiles and links a C file on the device, then runs it with ioscc's JIT if JIT is on. Uses the toolchain artifact from a finished
 # build-ios-compiler run, so the 2-3 hour LLVM build is NOT repeated.
 #
 # Put this file in your fork at .github/workflows/build-test-app.yml, then Actions >
 # build-test-app > Run workflow. Leave "run_id" blank to use the latest successful
 # build-ios-compiler run. Download the IosccTest-ipa artifact and sideload it.
 #
-# NOT YET RUN. Things marked CHECK are guesses.
+# The app sources were compile-checked with clang 21.1.8 against the iOS 26.5 SDK, and test-linked
+# with a stub in place of libioscc.a. The full build with the real libraries has NOT been run yet.
 
 name: build-test-app
 
@@ -73,7 +74,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y make zip curl git pkg-config libplist-dev libssl-dev xz-utils wget gnupg lsb-release software-properties-common
 
-      - name: Install clang 21 (the app is ObjC++, and the iOS 26.5 SDK's libc++ needs clang 19+)
+      - name: Install clang 21 (the iOS 26.5 SDK needs a recent clang; clang 18 fails on its headers)
         run: |
           wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
           chmod +x /tmp/llvm.sh
@@ -103,53 +104,66 @@ jobs:
           find art -path '*llvm-ios-build/lib/*.a' -exec cp {} "$P/lib/llvm/" \;
           ls "$P/lib/llvm" | wc -l
           cp ioscc.h "$P/src/ioscc.h"
-          cat > "$P/src/main.mm" <<'EOF'
-          // IosccTest: proves clang + lld (libioscc.a) run inside an iOS app, with no fork/exec.
-          // Tap "Run compile test": it compiles a hello.c to an object file, links it to a Mach-O,
-          // and prints everything it sees. "Copy log" puts the log on the clipboard.
-          #import <UIKit/UIKit.h>
-          #include <fcntl.h>
-          #include <unistd.h>
-          #include <string>
-          #include <vector>
+          cat > "$P/src/ioscc_test.h" <<'EOF'
+          // Glue between the UIKit side (main.m, plain Objective-C) and the clang/lld side (runner.m).
+          #ifndef IOSCC_TEST_H
+          #define IOSCC_TEST_H
+          #ifdef __cplusplus
           extern "C" {
-          #include "ioscc.h"
+          #endif
+          typedef void (*IosccLogFn)(const char *line);
+          void ioscc_run_test(IosccLogFn log);
+          #ifdef __cplusplus
           }
+          #endif
+          #endif
+          EOF
+          cat > "$P/src/runner.m" <<'EOF'
+          // Runs clang + lld in-process (libioscc.a). Plain Objective-C on purpose: with the iOS 26.5 SDK
+          // and clang 21, both the UIKit and Foundation modules fail to build in Objective-C++ mode.
+          // The C++ runtime that libioscc.a needs comes from LIBS="c++" in ipa.conf.
+          #import <Foundation/Foundation.h>
+          #include <fcntl.h>
+          #include <stdlib.h>
+          #include <unistd.h>
+          #include "ioscc.h"
+          #include "ioscc_test.h"
 
-          static NSMutableString *gLog;
-          static UITextView *gView;
+          static IosccLogFn gLogFn;
 
           static void logf_(NSString *fmt, ...) {
           	va_list ap; va_start(ap, fmt);
           	NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
           	va_end(ap);
-          	dispatch_async(dispatch_get_main_queue(), ^{
-          		[gLog appendFormat:@"%@\n", s];
-          		gView.text = gLog;
-          		[gView scrollRangeToVisible:NSMakeRange(gLog.length, 0)];
-          	});
+          	if (gLogFn) gLogFn(s.UTF8String);
           }
 
-          // Run fn with stderr (fd 2) redirected to a file, because clang and lld print diagnostics there.
-          static NSString *captureStderr(int (^fn)(void), int *rc) {
-          	NSString *p = [NSTemporaryDirectory() stringByAppendingPathComponent:@"ioscc-stderr.txt"];
-          	fflush(stderr);
-          	int saved = dup(STDERR_FILENO);
+          // Run fn with one file descriptor (2 = stderr, 1 = stdout) redirected to a file and return what
+          // was written. clang and lld print diagnostics on stderr; the JIT-run program prints on stdout.
+          static NSString *captureFd(int target, int (^fn)(void), int *rc) {
+          	NSString *p = [NSTemporaryDirectory() stringByAppendingPathComponent:
+          		[NSString stringWithFormat:@"ioscc-fd%d.txt", target]];
+          	fflush(stdout); fflush(stderr);
+          	int saved = dup(target);
           	int fd = open(p.fileSystemRepresentation, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-          	dup2(fd, STDERR_FILENO);
+          	dup2(fd, target);
           	close(fd);
           	*rc = fn();
-          	fflush(stderr);
-          	dup2(saved, STDERR_FILENO);
+          	fflush(stdout); fflush(stderr);
+          	dup2(saved, target);
           	close(saved);
           	return [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil] ?: @"";
           }
 
-          static int callArgv(int (*f)(int, const char **), const std::vector<std::string> &a) {
-          	std::vector<const char *> v;
-          	for (const auto &s : a) v.push_back(s.c_str());
-          	v.push_back(nullptr);
-          	return f((int)a.size(), v.data());
+          // Call an argc/argv entry point with an array of strings.
+          static int callArgv(int (*f)(int, const char **), NSArray<NSString *> *args) {
+          	int n = (int)args.count;
+          	const char **v = calloc((size_t)n + 1, sizeof(char *));
+          	for (int i = 0; i < n; i++) v[i] = strdup(args[(NSUInteger)i].UTF8String);
+          	int rc = f(n, v);
+          	for (int i = 0; i < n; i++) free((void *)v[i]);
+          	free(v);
+          	return rc;
           }
 
           static void listTree(NSString *root, int depth, NSString *indent, int *budget) {
@@ -180,7 +194,8 @@ jobs:
           	return nil;
           }
 
-          static void runTest(void) {
+          void ioscc_run_test(IosccLogFn log) {
+          	gLogFn = log;
           	NSFileManager *fm = NSFileManager.defaultManager;
           	logf_(@"=== ioscc test ===");
           	logf_(@"ioscc_version: %s", ioscc_version());
@@ -205,18 +220,16 @@ jobs:
           		writeToFile:src atomically:YES encoding:NSUTF8StringEncoding error:nil];
 
           	int rc = -1;
-          	std::vector<std::string> cc = {
-          		clangBin.UTF8String, "-c", "-target", "arm64-apple-ios15.0",
-          		"-isysroot", sysroot.UTF8String, "-O0", src.UTF8String, "-o", obj.UTF8String };
-          	NSString *e1 = captureStderr(^int { return callArgv(ioscc_cc, cc); }, &rc);
+          	NSArray *cc = @[ clangBin, @"-c", @"-target", @"arm64-apple-ios15.0",
+          		@"-isysroot", sysroot, @"-O0", src, @"-o", obj ];
+          	NSString *e1 = captureFd(STDERR_FILENO, ^int { return callArgv(ioscc_cc, cc); }, &rc);
           	logf_(@"compile rc=%d  object exists=%d", rc, (int)[fm fileExistsAtPath:obj]);
           	if (e1.length) logf_(@"compile stderr:\n%@", e1);
           	if (rc != 0) { logf_(@"STOP: compile failed."); return; }
 
-          	std::vector<std::string> ld = {
-          		"ld64.lld", "-arch", "arm64", "-platform_version", "ios", "15.0", "15.0",
-          		"-syslibroot", sysroot.UTF8String, "-lSystem", "-o", out.UTF8String, obj.UTF8String };
-          	NSString *e2 = captureStderr(^int { return callArgv(ioscc_ld, ld); }, &rc);
+          	NSArray *ld = @[ @"ld64.lld", @"-arch", @"arm64", @"-platform_version", @"ios", @"15.0", @"26.5",
+          		@"-syslibroot", sysroot, @"-adhoc_codesign", @"-lSystem", @"-o", out, obj ];
+          	NSString *e2 = captureFd(STDERR_FILENO, ^int { return callArgv(ioscc_ld, ld); }, &rc);
           	logf_(@"link rc=%d  output exists=%d", rc, (int)[fm fileExistsAtPath:out]);
           	if (e2.length) logf_(@"link stderr:\n%@", e2);
           	if (rc != 0) { logf_(@"STOP: link failed."); return; }
@@ -226,6 +239,47 @@ jobs:
           	logf_(@"output size: %lu bytes", (unsigned long)d.length);
           	if (d.length >= 4) logf_(@"first bytes: %02x %02x %02x %02x (a 64-bit Mach-O starts cf fa ed fe)", b[0], b[1], b[2], b[3]);
           	logf_(@"=== PASS: compiled and linked on device ===");
+
+          	// Step 3: run hello.o inside this app with ioscc's JIT. Needs JIT on (the app must be under a
+          	// debugger, e.g. enabled with StikDebug). Without JIT this step is skipped, not failed.
+          	if (!ioscc_jit_enabled()) {
+          		logf_(@"JIT is off, so the run step is skipped. Enable JIT for IosccTest (for example with StikDebug), then tap Run again.");
+          		return;
+          	}
+          	logf_(@"JIT is on: loading hello.o");
+          	__block ioscc_jit *jit = NULL;
+          	NSString *e3 = captureFd(STDERR_FILENO, ^int {
+          		const char *objs[] = { obj.UTF8String };
+          		jit = ioscc_jit_load(1, objs);
+          		return jit ? 0 : 1;
+          	}, &rc);
+          	if (e3.length) logf_(@"jit load stderr:\n%@", e3);
+          	if (!jit) { logf_(@"STOP: JIT load failed."); return; }
+          	NSString *printed = captureFd(STDOUT_FILENO, ^int {
+          		const char *args[] = { "hello" };
+          		return ioscc_jit_main(jit, 1, args);
+          	}, &rc);
+          	logf_(@"program exit code: %d", rc);
+          	logf_(@"program output: %@", printed.length ? printed : @"(nothing)");
+          	if (rc == 0 && [printed containsString:@"hello from on-device clang"])
+          		logf_(@"=== PASS: compiled, linked and RAN on device ===");
+          }
+          EOF
+          cat > "$P/src/main.m" <<'EOF'
+          // IosccTest UI (plain Objective-C). Tap "Run compile test"; "Copy log" copies the log.
+          #import <UIKit/UIKit.h>
+          #include "ioscc_test.h"
+
+          static NSMutableString *gLog;
+          static UITextView *gView;
+
+          static void logLine(const char *line) {
+          	NSString *s = [NSString stringWithUTF8String:line ?: ""];
+          	dispatch_async(dispatch_get_main_queue(), ^{
+          		[gLog appendFormat:@"%@\n", s];
+          		gView.text = gLog;
+          		[gView scrollRangeToVisible:NSMakeRange(gLog.length, 0)];
+          	});
           }
 
           @interface VC : UIViewController
@@ -262,7 +316,7 @@ jobs:
           		[gView.bottomAnchor constraintEqualToAnchor:g.bottomAnchor] ]];
           }
           - (void)run {
-          	NSThread *t = [[NSThread alloc] initWithBlock:^{ runTest(); }];
+          	NSThread *t = [[NSThread alloc] initWithBlock:^{ ioscc_run_test(logLine); }];
           	t.stackSize = 8 * 1024 * 1024;  // clang is recursive; ioscc.h asks for 8 MB
           	[t start];
           }
