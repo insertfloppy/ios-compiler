@@ -6,6 +6,9 @@
 # build-test-app > Run workflow. Leave "run_id" blank to use the latest successful
 # build-ios-compiler run. Download the IosccTest-ipa artifact and sideload it.
 #
+# Opening the app runs the test by itself: it asks StikDebug for JIT, runs when you come back, and
+# opens a pre-filled GitHub issue with the log in Safari. Tap "Create" there to send it.
+#
 # The app sources were compile-checked with clang 21.1.8 against the iOS 26.5 SDK, and test-linked
 # with a stub in place of libioscc.a. The full build with the real libraries has NOT been run yet.
 
@@ -289,12 +292,17 @@ jobs:
           EOF
           cat > "$P/src/main.m" <<'EOF'
           // IosccTest UI (plain Objective-C). Tap "Run compile test"; "Copy log" copies the log.
+          // On launch it runs by itself: opens StikDebug to enable JIT, runs the test when you come back,
+          // then opens a pre-filled GitHub issue with the log in Safari, so only "Create" needs a tap.
           #import <UIKit/UIKit.h>
+          #include <sys/sysctl.h>
           #include <unistd.h>
+          #include "ioscc.h"
           #include "ioscc_test.h"
 
           static NSMutableString *gLog;
           static UITextView *gView;
+          static BOOL gAutoRan, gAskedJIT;
 
           static void logLine(const char *line) {
           	NSString *s = [NSString stringWithUTF8String:line ?: ""];
@@ -320,7 +328,10 @@ jobs:
           	UIButton *jit = [UIButton buttonWithType:UIButtonTypeSystem];
           	[jit setTitle:@"Enable JIT" forState:UIControlStateNormal];
           	[jit addTarget:self action:@selector(enableJIT) forControlEvents:UIControlEventTouchUpInside];
-          	UIStackView *bar = [[UIStackView alloc] initWithArrangedSubviews:@[ jit, run, copy ]];
+          	UIButton *send = [UIButton buttonWithType:UIButtonTypeSystem];
+          	[send setTitle:@"Send log" forState:UIControlStateNormal];
+          	[send addTarget:self action:@selector(sendLog) forControlEvents:UIControlEventTouchUpInside];
+          	UIStackView *bar = [[UIStackView alloc] initWithArrangedSubviews:@[ jit, run, copy, send ]];
           	bar.distribution = UIStackViewDistributionFillEqually;
           	gLog = [NSMutableString new];
           	gView = [UITextView new];
@@ -340,9 +351,30 @@ jobs:
           		[gView.leadingAnchor constraintEqualToAnchor:g.leadingAnchor],
           		[gView.trailingAnchor constraintEqualToAnchor:g.trailingAnchor],
           		[gView.bottomAnchor constraintEqualToAnchor:g.bottomAnchor] ]];
+          	[NSNotificationCenter.defaultCenter addObserver:self selector:@selector(autoStep)
+          		name:UIApplicationDidBecomeActiveNotification object:nil];
           }
-          - (void)run {
-          	NSThread *t = [[NSThread alloc] initWithBlock:^{ ioscc_run_test(logLine); }];
+          // Runs each time the app comes to the front, until the automatic test has run once.
+          // 1st time without JIT: open StikDebug. Back again (with or without JIT): run, then send the log.
+          - (void)autoStep {
+          	if (gAutoRan) return;
+          	if (!ioscc_jit_enabled() && !gAskedJIT) {
+          		gAskedJIT = YES;
+          		logLine("Auto: JIT is off, asking StikDebug to enable it. Come back here when StikDebug is done.");
+          		[self enableJIT];
+          		return;
+          	}
+          	gAutoRan = YES;
+          	logLine(ioscc_jit_enabled() ? "Auto: JIT is on, running the test." : "Auto: JIT is still off, running the compile test only.");
+          	[self runThenSend:YES];
+          }
+          - (void)run { [self runThenSend:NO]; }
+          - (void)runThenSend:(BOOL)send {
+          	NSThread *t = [[NSThread alloc] initWithBlock:^{
+          		ioscc_run_test(logLine);
+          		// Queued after the log lines above, so the log is complete when this runs.
+          		if (send) dispatch_async(dispatch_get_main_queue(), ^{ [self sendLog]; });
+          	}];
           	t.stackSize = 8 * 1024 * 1024;  // clang is recursive; ioscc.h asks for 8 MB
           	[t start];
           }
@@ -359,6 +391,41 @@ jobs:
           	}];
           }
           - (void)copyLog { UIPasteboard.generalPasteboard.string = gLog ?: @""; }
+          static NSString *queryEscape(NSString *s) {
+          	NSMutableCharacterSet *ok = [NSCharacterSet.URLQueryAllowedCharacterSet mutableCopy];
+          	[ok removeCharactersInString:@"&=+#?"];
+          	return [s stringByAddingPercentEncodingWithAllowedCharacters:ok];
+          }
+          // Opens a new GitHub issue in the fork with the log filled in; tap "Create" in Safari to send it.
+          // The full log is also copied, in case it had to be shortened to fit in the link.
+          - (void)sendLog {
+          	[self copyLog];
+          	NSString *log = gLog ?: @"";
+          	char machine[64] = "?";
+          	size_t len = sizeof machine;
+          	sysctlbyname("hw.machine", machine, &len, NULL, 0);
+          	NSString *result = [log containsString:@"PASS: compiled, linked and RAN"] ? @"RAN"
+          		: [log containsString:@"PASS: compiled and linked"] ? @"linked, did not run" : @"failed";
+          	NSString *title = [NSString stringWithFormat:@"IosccTest log: %@ (%s, iOS %@)", result, machine,
+          		UIDevice.currentDevice.systemVersion];
+          	NSString *base = [NSString stringWithFormat:@"https://github.com/@REPO@/issues/new?title=%@&body=", queryEscape(title)];
+          	NSString *body = nil;
+          	// GitHub refuses very long links; keep the start and as much of the end as fits.
+          	for (NSUInteger tail = log.length; ; tail = tail * 3 / 4) {
+          		NSString *text = log;
+          		if (tail < log.length) {
+          			NSUInteger head = MIN((NSUInteger)800, log.length - tail);
+          			text = [NSString stringWithFormat:@"%@\n... (cut here, paste the full log from the clipboard) ...\n%@",
+          				[log substringToIndex:head], [log substringFromIndex:log.length - tail]];
+          		}
+          		body = queryEscape([NSString stringWithFormat:@"<!-- ioscc-test-log -->\n```\n%@\n```\n", text]);
+          		if (base.length + body.length <= 7000 || tail < 200) break;
+          	}
+          	NSURL *url = [NSURL URLWithString:[base stringByAppendingString:body]];
+          	[UIApplication.sharedApplication openURL:url options:@{} completionHandler:^(BOOL ok) {
+          		if (!ok) logLine("Could not open the GitHub link. Use Copy log instead.");
+          	}];
+          }
           @end
 
           @interface AppDelegate : UIResponder <UIApplicationDelegate>
@@ -379,6 +446,8 @@ jobs:
           	}
           }
           EOF
+          # The "Send log" button opens a new issue in this repository.
+          sed -i "s|@REPO@|$GITHUB_REPOSITORY|" "$P/src/main.m"
           cat > "$P/ipa.conf" <<'EOF'
           NAME="IosccTest"
           BUNDLE_ID="com.example.iosccpest"
