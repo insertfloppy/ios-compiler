@@ -36,11 +36,16 @@
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/ExecutionEngine/Orc/Shared/AllocationActions.h"
+#include "llvm/Support/Memory.h"
+#include <mach/mach.h>
+#include <mach/mach_error.h>
 #include <mutex>
 #include <objc/runtime.h>
 #include <pthread.h>
 #include <setjmp.h>
 #include <signal.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 LLD_HAS_DRIVER(macho)
@@ -350,6 +355,67 @@ public:
 	void notifyTransferringResources(llvm::orc::JITDylib &, llvm::orc::ResourceKey, llvm::orc::ResourceKey) override {}
 };
 
+// TXM (iOS 26+, A17 Pro/M4 и новее): отладчика мало, исполняемую память готовит сам отладчик
+// (StikDebug со скриптом universal.js, см. ioscc_jit_prepare). Код пишем через RW-псевдоним
+// той же памяти, исполняем по RX-адресу; данные — в обычной RW-памяти рядом (ADRP: ±4 ГБ).
+// Память не освобождается: сессии живут до конца процесса.
+struct TXMPool {
+	char *rx = nullptr, *rw = nullptr, *data = nullptr;
+	size_t codeSize = 0, codeUsed = 0, dataSize = 0, dataUsed = 0;
+	std::mutex m;
+} txm;
+
+class TXMMemoryManager : public llvm::jitlink::JITLinkMemoryManager {
+	class InFlight : public InFlightAlloc {
+	public:
+		InFlight(llvm::jitlink::LinkGraph &G, llvm::jitlink::BasicLayout BL) : G(G), BL(std::move(BL)) {}
+		void finalize(OnFinalizedFunction OnFinalized) override {
+			for (auto &KV : BL.segments())
+				if ((KV.first.getMemProt() & llvm::orc::MemProt::Exec) != llvm::orc::MemProt::None)
+					llvm::sys::Memory::InvalidateInstructionCache(KV.second.Addr.toPtr<void *>(),
+					                                              KV.second.ContentSize + KV.second.ZeroFillSize);
+			auto dealloc = llvm::orc::shared::runFinalizeActions(G.allocActions());
+			if (!dealloc) return OnFinalized(dealloc.takeError());
+			OnFinalized(FinalizedAlloc(llvm::orc::ExecutorAddr::fromPtr(txm.rx)));
+		}
+		void abandon(OnAbandonedFunction OnAbandoned) override { OnAbandoned(llvm::Error::success()); }
+
+	private:
+		llvm::jitlink::LinkGraph &G;
+		llvm::jitlink::BasicLayout BL;
+	};
+
+public:
+	void allocate(const llvm::jitlink::JITLinkDylib *, llvm::jitlink::LinkGraph &G, OnAllocatedFunction OnAllocated) override {
+		llvm::jitlink::BasicLayout BL(G);
+		{
+			std::lock_guard<std::mutex> lock(txm.m);
+			for (auto &KV : BL.segments()) {
+				auto &Seg = KV.second;
+				uint64_t align = std::max<uint64_t>(Seg.Alignment.value(), 16384);
+				uint64_t size = llvm::alignTo(Seg.ContentSize + Seg.ZeroFillSize, 16384);
+				bool exec = (KV.first.getMemProt() & llvm::orc::MemProt::Exec) != llvm::orc::MemProt::None;
+				size_t &used = exec ? txm.codeUsed : txm.dataUsed;
+				size_t off = llvm::alignTo(used, align);
+				if (off + size > (exec ? txm.codeSize : txm.dataSize))
+					return OnAllocated(llvm::make_error<llvm::StringError>(
+					    exec ? "JIT code memory is full (ioscc_jit_prepare)" : "JIT data memory is full",
+					    llvm::inconvertibleErrorCode()));
+				used = off + size;
+				Seg.Addr = llvm::orc::ExecutorAddr::fromPtr((exec ? txm.rx : txm.data) + off);
+				Seg.WorkingMem = (exec ? txm.rw : txm.data) + off;
+				memset(Seg.WorkingMem, 0, size);
+			}
+		}
+		if (auto e = BL.apply()) return OnAllocated(std::move(e));
+		OnAllocated(std::make_unique<InFlight>(G, std::move(BL)));
+	}
+	void deallocate(std::vector<FinalizedAlloc> Allocs, OnDeallocatedFunction OnDeallocated) override {
+		for (auto &a : Allocs) a.release();
+		OnDeallocated(llvm::Error::success());
+	}
+};
+
 // exit()/abort() из JIT-кода не должны закрывать Forge: прыгаем обратно в ioscc_jit_main
 sigjmp_buf jumpBack;
 volatile sig_atomic_t guarded = 0;
@@ -399,6 +465,11 @@ template <typename F> int guardedCall(F fn) {
 	return r;
 }
 
+// «Системные вызовы» скрипта universal.js (StikDebug/StikJIT, INTEGRATION.md). Без отладчика со
+// скриптом brk даёт SIGTRAP — guardedCall его ловит.
+__attribute__((noinline, naked)) void JIT26Detach() { __asm__("mov x16, #0\n brk #0xf00d\n ret\n"); }
+__attribute__((noinline, naked)) void *JIT26PrepareRegion(void *, size_t) { __asm__("mov x16, #1\n brk #0xf00d\n ret\n"); }
+
 void registerObjC(ioscc_jit *s) {
 	static const uint32_t defaultInfo[2] = {0, 0x40};
 	for (auto &rg : s->selrefs)
@@ -434,6 +505,47 @@ extern "C" int ioscc_jit_enabled(void) {
 	return (flags & 0x10000000 /* CS_DEBUGGED */) != 0;
 }
 
+extern "C" int ioscc_jit_prepare(size_t codeSize) {
+	if (txm.rx) return 0;
+	if (!ioscc_jit_enabled()) {
+		fprintf(stderr, "jit: JIT is off\n");
+		return 1;
+	}
+	codeSize = llvm::alignTo(codeSize ? codeSize : 16 << 20, 16384);
+	void *rx = nullptr;
+	if (guardedCall([&] { rx = JIT26PrepareRegion(nullptr, codeSize); }) || !rx) {
+		fprintf(stderr, "jit: no answer from the debugger script; enable JIT in StikDebug with universal.js\n");
+		return 2;
+	}
+	vm_address_t rw = 0;
+	vm_prot_t cur, max;
+	kern_return_t kr = vm_remap(mach_task_self(), &rw, codeSize, 0, VM_FLAGS_ANYWHERE, mach_task_self(),
+	                            (vm_address_t)rx, FALSE, &cur, &max, VM_INHERIT_NONE);
+	if (kr == KERN_SUCCESS) kr = vm_protect(mach_task_self(), rw, codeSize, FALSE, VM_PROT_READ | VM_PROT_WRITE);
+	if (kr != KERN_SUCCESS) {
+		fprintf(stderr, "jit: vm_remap/vm_protect: %s\n", mach_error_string(kr));
+		guardedCall([] { JIT26Detach(); });
+		return 3;
+	}
+	// данные — рядом с кодом, чтобы ADRP из кода дотягивался
+	size_t dataSize = 4 * codeSize;
+	void *data = mmap((char *)rx + codeSize, dataSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+	int64_t dist = (char *)data - (char *)rx;
+	if (data == MAP_FAILED || dist > (2ll << 30) || dist < -(2ll << 30)) {
+		fprintf(stderr, "jit: no data memory near the code region\n");
+		guardedCall([] { JIT26Detach(); });
+		return 4;
+	}
+	guardedCall([] { JIT26Detach(); });
+	std::lock_guard<std::mutex> lock(txm.m);
+	txm.rx = (char *)rx;
+	txm.rw = (char *)rw;
+	txm.data = (char *)data;
+	txm.codeSize = codeSize;
+	txm.dataSize = dataSize;
+	return 0;
+}
+
 extern "C" ioscc_jit *ioscc_jit_load(int n, const char **objects) {
 	using namespace llvm::orc;
 	initTargets();
@@ -444,7 +556,8 @@ extern "C" ioscc_jit *ioscc_jit_load(int n, const char **objects) {
 	};
 	auto J = LLJITBuilder()
 	             .setObjectLinkingLayerCreator([](ExecutionSession &ES) -> llvm::Expected<std::unique_ptr<ObjectLayer>> {
-		             auto L = std::make_unique<ObjectLinkingLayer>(ES);
+		             static TXMMemoryManager txmMemMgr;
+		             auto L = txm.rx ? std::make_unique<ObjectLinkingLayer>(ES, txmMemMgr) : std::make_unique<ObjectLinkingLayer>(ES);
 		             L->addPlugin(std::make_shared<ObjCPlugin>());
 		             return L;
 	             })

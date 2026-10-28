@@ -3,6 +3,7 @@
 // на потоке со стеком от 8 МБ (clang рекурсивен).
 #ifndef IOSCC_H
 #define IOSCC_H
+#include <stddef.h>
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -38,6 +39,12 @@ typedef struct ioscc_jit ioscc_jit;
 
 // Включён ли JIT (CS_DEBUGGED).
 int ioscc_jit_enabled(void);
+
+// TXM (iOS 26+, A17 Pro/M4 и новее): исполняемую память готовит отладчик. Вызвать один раз после того,
+// как JIT включён в StikDebug со скриптом universal.js (до первого ioscc_jit_load). codeSize — размер
+// памяти под код (0 — 16 МБ), данные получают вчетверо больше. 0 — успех, иначе ошибка в stderr
+// (2 — скрипт не ответил). Без вызова JIT использует обычную память (устройства без TXM).
+int ioscc_jit_prepare(size_t codeSize);
 
 // Линкует n объектных файлов. Ошибки — в stderr, тогда NULL. Сессия живёт до конца процесса.
 ioscc_jit *ioscc_jit_load(int n, const char **objects);

@@ -136,6 +136,7 @@ jobs:
           #import <Foundation/Foundation.h>
           #include <fcntl.h>
           #include <stdlib.h>
+          #include <string.h>
           #include <unistd.h>
           #include "ioscc.h"
           #include "ioscc_test.h"
@@ -260,6 +261,13 @@ jobs:
           		logf_(@"JIT is off, so the run step is skipped. Enable JIT for IosccTest (for example with StikDebug), then tap Run again.");
           		return;
           	}
+          	// TXM devices (iOS 26+, A17 Pro/M4 and newer) need StikDebug's universal.js script to prepare
+          	// executable memory. Without the script this fails cleanly and the plain JIT path is used.
+          	__block int prep = -1;
+          	NSString *ep = captureFd(STDERR_FILENO, ^int { prep = ioscc_jit_prepare(16 << 20); return prep; }, &rc);
+          	logf_(@"ioscc_jit_prepare: %d%@", prep, prep == 0 ? @" (executable memory ready)" : @"");
+          	if (ep.length) logf_(@"prepare stderr:\n%@", ep);
+          	if (prep != 0) logf_(@"Continuing without it. On an iPad with M4 or an iPhone 15 Pro or newer, tap \"Enable JIT\" in this app instead of enabling JIT from StikDebug directly.");
           	logf_(@"JIT is on: loading hello.o");
           	__block ioscc_jit *jit = NULL;
           	NSString *e3 = captureFd(STDERR_FILENO, ^int {
@@ -273,7 +281,7 @@ jobs:
           		const char *args[] = { "hello" };
           		return ioscc_jit_main(jit, 1, args);
           	}, &rc);
-          	logf_(@"program exit code: %d", rc);
+          	logf_(@"program exit code: %d%@", rc, rc > 128 ? [NSString stringWithFormat:@" (crashed: %s)", strsignal(rc - 128)] : @"");
           	logf_(@"program output: %@", printed.length ? printed : @"(nothing)");
           	if (rc == 0 && [printed containsString:@"hello from on-device clang"])
           		logf_(@"=== PASS: compiled, linked and RAN on device ===");
@@ -282,6 +290,7 @@ jobs:
           cat > "$P/src/main.m" <<'EOF'
           // IosccTest UI (plain Objective-C). Tap "Run compile test"; "Copy log" copies the log.
           #import <UIKit/UIKit.h>
+          #include <unistd.h>
           #include "ioscc_test.h"
 
           static NSMutableString *gLog;
@@ -308,7 +317,10 @@ jobs:
           	UIButton *copy = [UIButton buttonWithType:UIButtonTypeSystem];
           	[copy setTitle:@"Copy log" forState:UIControlStateNormal];
           	[copy addTarget:self action:@selector(copyLog) forControlEvents:UIControlEventTouchUpInside];
-          	UIStackView *bar = [[UIStackView alloc] initWithArrangedSubviews:@[ run, copy ]];
+          	UIButton *jit = [UIButton buttonWithType:UIButtonTypeSystem];
+          	[jit setTitle:@"Enable JIT" forState:UIControlStateNormal];
+          	[jit addTarget:self action:@selector(enableJIT) forControlEvents:UIControlEventTouchUpInside];
+          	UIStackView *bar = [[UIStackView alloc] initWithArrangedSubviews:@[ jit, run, copy ]];
           	bar.distribution = UIStackViewDistributionFillEqually;
           	gLog = [NSMutableString new];
           	gView = [UITextView new];
@@ -333,6 +345,18 @@ jobs:
           	NSThread *t = [[NSThread alloc] initWithBlock:^{ ioscc_run_test(logLine); }];
           	t.stackSize = 8 * 1024 * 1024;  // clang is recursive; ioscc.h asks for 8 MB
           	[t start];
+          }
+          // Asks StikDebug to attach with universal.js, which prepares JIT memory on TXM devices.
+          - (void)enableJIT {
+          	NSURLComponents *c = [NSURLComponents componentsWithString:@"stikdebug://enable-jit"];
+          	c.queryItems = @[
+          		[NSURLQueryItem queryItemWithName:@"bundle-id" value:NSBundle.mainBundle.bundleIdentifier],
+          		[NSURLQueryItem queryItemWithName:@"pid" value:[NSString stringWithFormat:@"%d", getpid()]],
+          		[NSURLQueryItem queryItemWithName:@"script-name" value:@"universal.js"] ];
+          	logLine([NSString stringWithFormat:@"Opening %@", c.URL.absoluteString].UTF8String);
+          	[UIApplication.sharedApplication openURL:c.URL options:@{} completionHandler:^(BOOL ok) {
+          		if (!ok) logLine("Could not open StikDebug. Is it installed?");
+          	}];
           }
           - (void)copyLog { UIPasteboard.generalPasteboard.string = gLog ?: @""; }
           @end
