@@ -11,9 +11,6 @@
 name: rebuild-ioscc
 
 on:
-  # TEMPORARY: lets the PR branch test itself; remove before merging.
-  push:
-    branches: [claude/project-thread-de30qo]
   workflow_dispatch:
     inputs:
       run_id:
