@@ -104,6 +104,14 @@ jobs:
           cp "$LIB" "$P/lib/"
           [ -d "$OUTDIR/toolchain" ] || { echo "toolchain dir not found next to libioscc.a"; exit 1; }
           cp -a "$OUTDIR/toolchain" "$P/toolchain"
+          # Shown at the top of the app's log, so we can tell which libioscc.a the installed app has.
+          {
+            echo "toolchain run: ${{ steps.find.outputs.run_id }}"
+            echo "test-app run: ${{ github.run_id }}"
+            echo "libioscc.a sha256: $(sha256sum "$LIB" | cut -c1-16)"
+            if grep -q setUpInactivePlatform "$LIB"; then echo "jit platform: inactive"; else echo "jit platform: default (old libioscc.a)"; fi
+          } > "$P/toolchain/BUILD_INFO"
+          cat "$P/toolchain/BUILD_INFO"
           find art -path '*llvm-ios-build/lib/*.a' -exec cp {} "$P/lib/llvm/" \;
           ls "$P/lib/llvm" | wc -l
           cp ioscc.h "$P/src/ioscc.h"
@@ -202,6 +210,9 @@ jobs:
           	NSFileManager *fm = NSFileManager.defaultManager;
           	logf_(@"=== ioscc test ===");
           	logf_(@"ioscc_version: %s", ioscc_version());
+          	NSString *info = [NSString stringWithContentsOfFile:[NSBundle.mainBundle.bundlePath
+          		stringByAppendingPathComponent:@"toolchain/BUILD_INFO"] encoding:NSUTF8StringEncoding error:nil];
+          	logf_(@"%@", info ?: @"(no BUILD_INFO)");
           	NSString *tc = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"toolchain"];
           	logf_(@"toolchain dir: %@ (exists=%d)", tc, (int)[fm fileExistsAtPath:tc]);
           	int budget = 60;

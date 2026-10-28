@@ -75,12 +75,6 @@ jobs:
           clang++ --version
           ls -d llvm-ios-build/include llvm-src/llvm/include prev/out/toolchain/sdk
 
-      - name: Apply the ioscc.cpp patches
-        # Same patch as build-ios-compiler (only applied if the line is still there).
-        run: |
-          sed -i '/mangleAndIntern("atexit")/d' ioscc.cpp
-          if grep -q 'mangleAndIntern("atexit")' ioscc.cpp; then echo "atexit patch did not apply"; exit 1; fi
-
       - name: Build libioscc.a
         # The trimmed SDK inside the toolchain has the headers ioscc.cpp needs, so no ipab setup.
         run: |

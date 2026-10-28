@@ -363,6 +363,7 @@ void jitExit(int code) {
 	siglongjmp(jumpBack, 0x100 | (code & 0xff));
 }
 void jitAbort() { siglongjmp(jumpBack, 128 + SIGABRT); }
+char dsoHandle;
 int jitAtexit(void (*fn)(void)) {
 	if (running) running->atexits.push_back(fn);
 	return 0;
@@ -447,6 +448,10 @@ extern "C" ioscc_jit *ioscc_jit_load(int n, const char **objects) {
 		             L->addPlugin(std::make_shared<ObjCPlugin>());
 		             return L;
 	             })
+	             // Без платформы ORC: GenericLLVMIRPlatform (по умолчанию в LLVM 22) сам определяет atexit
+	             // в main JITDylib, и наши хуки дают "duplicate definition of symbol '_atexit'".
+	             // Конструкторы и ObjC регистрируем сами (ObjCPlugin, registerObjC).
+	             .setPlatformSetUp(setUpInactivePlatform)
 	             .create();
 	if (!J) return fail(J.takeError());
 
@@ -458,8 +463,9 @@ extern "C" ioscc_jit *ioscc_jit_load(int n, const char **objects) {
 	hooks[s->J->mangleAndIntern("exit")] = {ExecutorAddr::fromPtr(&jitExit), flags};
 	hooks[s->J->mangleAndIntern("_exit")] = {ExecutorAddr::fromPtr(&jitExit), flags};
 	hooks[s->J->mangleAndIntern("abort")] = {ExecutorAddr::fromPtr(&jitAbort), flags};
-	// "atexit" не подменяем: платформа LLJIT в LLVM 22 уже определяет его в main JITDylib
-	// (иначе "duplicate definition of symbol '_atexit'"). Пока обработчики atexit() из JIT-кода не вызываются.
+	hooks[s->J->mangleAndIntern("atexit")] = {ExecutorAddr::fromPtr(&jitAtexit), flags};
+	// без платформы __dso_handle никто не определяет, а он нужен C++-коду (__cxa_atexit)
+	hooks[s->J->mangleAndIntern("__dso_handle")] = {ExecutorAddr::fromPtr(&dsoHandle), llvm::JITSymbolFlags::Exported};
 	if (auto e = JD.define(absoluteSymbols(std::move(hooks)))) return fail(std::move(e));
 
 	// все символы всех файлов — чтобы слинковались и файлы, на которые никто не ссылается (ObjC-классы)
