@@ -116,16 +116,16 @@ jobs:
         if: failure()
         run: tail -n 100 build.log || true
 
-      - name: Patch ioscc.cpp (JIT load failed with "duplicate definition of symbol '_atexit'")
+      - name: Check the atexit fix in ioscc.cpp
         # LLVM 22's default LLJIT platform (GenericLLVMIRPlatform) already defines atexit in the main
-        # JITDylib, so ioscc's own absolute "atexit" hook collides with it. Drop that one hook; the
-        # exit/_exit/abort hooks do not collide and stay. Side effect: functions a JIT-run program
-        # registers with atexit() are not run when its main returns.
+        # JITDylib, so ioscc's own absolute "atexit" hook collided with it ("duplicate definition of
+        # symbol '_atexit'"). ioscc.cpp in this fork no longer has that hook; this step only removes it
+        # again if an older ioscc.cpp comes back. Side effect: functions a JIT-run program registers
+        # with atexit() are not run when its main returns.
         run: |
-          grep -n 'mangleAndIntern("atexit")' ioscc.cpp
           sed -i '/mangleAndIntern("atexit")/d' ioscc.cpp
           if grep -q 'mangleAndIntern("atexit")' ioscc.cpp; then echo "patch did not apply"; exit 1; fi
-          echo "atexit hook removed"
+          echo "no atexit hook in ioscc.cpp"
 
       - name: Build libioscc.a
         run: make

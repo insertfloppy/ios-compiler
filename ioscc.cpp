@@ -458,7 +458,8 @@ extern "C" ioscc_jit *ioscc_jit_load(int n, const char **objects) {
 	hooks[s->J->mangleAndIntern("exit")] = {ExecutorAddr::fromPtr(&jitExit), flags};
 	hooks[s->J->mangleAndIntern("_exit")] = {ExecutorAddr::fromPtr(&jitExit), flags};
 	hooks[s->J->mangleAndIntern("abort")] = {ExecutorAddr::fromPtr(&jitAbort), flags};
-	hooks[s->J->mangleAndIntern("atexit")] = {ExecutorAddr::fromPtr(&jitAtexit), flags};
+	// "atexit" не подменяем: платформа LLJIT в LLVM 22 уже определяет его в main JITDylib
+	// (иначе "duplicate definition of symbol '_atexit'"). Пока обработчики atexit() из JIT-кода не вызываются.
 	if (auto e = JD.define(absoluteSymbols(std::move(hooks)))) return fail(std::move(e));
 
 	// все символы всех файлов — чтобы слинковались и файлы, на которые никто не ссылается (ObjC-классы)

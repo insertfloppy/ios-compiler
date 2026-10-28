@@ -15,7 +15,7 @@ on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: "Run ID of a successful build-ios-compiler run (blank = latest successful)"
+        description: "Run ID of a successful build-ios-compiler or rebuild-ioscc run (blank = newest of either)"
         required: false
         default: ""
 
@@ -48,9 +48,12 @@ jobs:
         run: |
           id="$INPUT_RUN"
           if [ -z "$id" ]; then
-            id=$(gh run list --workflow build-ios-compiler.yml --status success --limit 1 --json databaseId --jq '.[0].databaseId')
+            # Newest successful run of either workflow that produces ios-compiler-out.
+            full=$(gh run list --workflow build-ios-compiler.yml --status success --limit 1 --json databaseId,createdAt 2>/dev/null || echo '[]')
+            quick=$(gh run list --workflow rebuild-ioscc.yml --status success --limit 1 --json databaseId,createdAt 2>/dev/null || echo '[]')
+            id=$(printf '%s\n%s\n' "$full" "$quick" | jq -s 'add | sort_by(.createdAt) | last | .databaseId')
           fi
-          if [ -z "$id" ] || [ "$id" = "null" ]; then echo "No successful build-ios-compiler run found"; exit 1; fi
+          if [ -z "$id" ] || [ "$id" = "null" ]; then echo "No successful toolchain run found"; exit 1; fi
           echo "Using run $id"
           echo "run_id=$id" >> "$GITHUB_OUTPUT"
 

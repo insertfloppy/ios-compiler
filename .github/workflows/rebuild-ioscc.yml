@@ -1,0 +1,107 @@
+# Rebuilds only libioscc.a (from ioscc.cpp) in a few minutes, reusing the LLVM build from a finished
+# build-ios-compiler run. Use it after changing ioscc.cpp, instead of the 2-3 hour full build.
+#
+# Needs a build-ios-compiler run that uploaded the "ioscc-dev" artifact (runs from 2026-10-26 on).
+# Produces a new "ios-compiler-out" artifact (new libioscc.a + the same toolchain and LLVM libraries),
+# which build-test-app picks up automatically when it is the newest.
+#
+# Put this file in your fork at .github/workflows/rebuild-ioscc.yml.
+# NOT YET RUN.
+
+name: rebuild-ioscc
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Run ID of a build-ios-compiler run with ioscc-dev (blank = latest successful)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find the full toolchain run
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          INPUT_RUN: ${{ inputs.run_id }}
+        run: |
+          id="$INPUT_RUN"
+          if [ -z "$id" ]; then
+            id=$(gh run list --workflow build-ios-compiler.yml --status success --limit 1 --json databaseId --jq '.[0].databaseId')
+          fi
+          if [ -z "$id" ] || [ "$id" = "null" ]; then echo "No successful build-ios-compiler run found"; exit 1; fi
+          echo "Using run $id"
+          echo "run_id=$id" >> "$GITHUB_OUTPUT"
+
+      - name: Download LLVM headers (ioscc-dev)
+        uses: actions/download-artifact@v4
+        with:
+          name: ioscc-dev
+          path: .
+          run-id: ${{ steps.find.outputs.run_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+
+      - name: Download the previous toolchain output
+        uses: actions/download-artifact@v4
+        with:
+          name: ios-compiler-out
+          path: prev
+          run-id: ${{ steps.find.outputs.run_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+
+      - name: Install clang 21 and llvm-ar
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget gnupg lsb-release software-properties-common
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 21
+          sudo apt-get install -y clang-21 llvm-21
+          sudo ln -sf /usr/bin/clang-21 /usr/bin/clang
+          sudo ln -sf /usr/bin/clang++-21 /usr/bin/clang++
+          clang++ --version
+          ls -d llvm-ios-build/include llvm-src/llvm/include prev/out/toolchain/sdk
+
+      - name: Apply the ioscc.cpp patches
+        # Same patch as build-ios-compiler (only applied if the line is still there).
+        run: |
+          sed -i '/mangleAndIntern("atexit")/d' ioscc.cpp
+          if grep -q 'mangleAndIntern("atexit")' ioscc.cpp; then echo "atexit patch did not apply"; exit 1; fi
+
+      - name: Build libioscc.a
+        # The trimmed SDK inside the toolchain has the headers ioscc.cpp needs, so no ipab setup.
+        run: |
+          rm -rf out
+          make SDK="$PWD/prev/out/toolchain/sdk" AR=llvm-ar-21
+          ls -l out/libioscc.a
+
+      - name: Assemble the new ios-compiler-out
+        run: |
+          mkdir -p new/out new/llvm-ios-build/lib
+          cp out/libioscc.a new/out/
+          cp -a prev/out/toolchain new/out/toolchain
+          mkdir -p new/out/toolchain/bin && touch new/out/toolchain/bin/.keep
+          cp prev/llvm-ios-build/lib/*.a new/llvm-ios-build/lib/
+          du -sh new/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-compiler-out
+          path: |
+            new/out/libioscc.a
+            new/out/toolchain
+            new/llvm-ios-build/lib/*.a
+          if-no-files-found: error
